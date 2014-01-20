@@ -1,0 +1,166 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+from subprocess import Popen, PIPE, call
+
+DOCUMENTATION = '''
+---
+module: postgresql_migration
+short_description: Executes SQL file if condition matches.
+description:
+   - Checks a precondition (result values of SQL query) and executes the given SQL files in a transaction.
+   - Intended for database initialization and migration. A good practive is writing SQL files indempotent whenever the condition holds or to create a table to hold a version of the database schema.
+version_added: "1.5"
+options:
+  condition:
+    description:
+      - SQL query returning a boolean value. This module does only perform an action if the returned value is true.
+    required: true
+  src:
+    description:
+      - SQL file to execute if condition query returns true.
+    required: true
+  name:
+    description:
+      - Name of the database to use for the condition query. The same database will be modified the if condition query matches.
+    required: true
+  login_user:
+    description:
+      - The username used to authenticate with
+    required: false
+    default: postgres
+  login_password:
+    description:
+      - The password used to authenticate with
+    required: false
+    default: null
+  login_host:
+    description:
+      - Host running the database
+    required: false
+    default: localhost
+  port:
+    description:
+      - Port to use to connect to database.
+    required: false
+    default: 5432
+'''
+
+EXAMPLES = '''
+# Execute if schema does not yet exist.
+- postgresql_migration: name=database_name
+                        condition="select not exists(select * from pg_tables where schemaname='application_schema')"
+                        src=test.sql
+'''
+
+import traceback
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    from psycopg2.extensions import ISOLATION_LEVEL_SERIALIZABLE
+except ImportError:
+    postgresqldb_found = False
+else:
+    postgresqldb_found = True
+
+class NotSupportedError(Exception):
+    pass
+
+
+# ===========================================
+# PostgreSQL module specific support methods.
+#
+def check_condition(db_connection, query):
+    """Runs the quey against the database and returns its boolean result. Raises exception if query does not yield a single boolean result."""
+    cursor = db_connection.cursor()
+    try:
+        cursor.execute(query)
+        row = cursor.fetchone()
+        if row==None:
+            raise ValueError("Condition query returned no result.")
+        elif len(row)!=1:
+            raise ValueError("Condition did not return exacly one column.")
+        else:
+            excess_row = cursor.fetchone()
+            if excess_row==None:
+                return row[0]
+            else:
+                raise ValueError("Condition did return more than 1 row.")
+    finally:
+        db_connection.rollback()
+        cursor.close()
+
+# ===========================================
+# Module execution.
+#
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            login_user=dict(default="postgres"),
+            login_password=dict(default=""),
+            login_host=dict(default=""),
+            port=dict(default="5432"),
+            db=dict(required=True, aliases=['name']),
+            condition=dict(required=True),
+            src=dict(required=True),
+        ),
+        supports_check_mode = True
+    )
+
+    if not postgresqldb_found:
+        module.fail_json(msg="the python psycopg2 module is required")
+
+    db = module.params["db"]
+    port = module.params["port"]
+    login_user = module.params["login_user"]
+    login_host = module.params["login_host"]
+    condition = module.params["condition"]
+    script = module.params["src"]
+
+    # To use defaults values, keyword arguments must be absent, so 
+    # check which values are empty and don't include in the **kw
+    # dictionary
+    params_map = {
+        "login_host":"host",
+        "login_user":"user",
+        "login_password":"password",
+        "port":"port"
+    }
+    kw = dict( (params_map[k], v) for (k, v) in module.params.iteritems() 
+              if k in params_map and v != '' )
+    try:
+        db_connection = psycopg2.connect(database=db, **kw)
+        db_connection.set_session(ISOLATION_LEVEL_SERIALIZABLE, readonly=False, deferrable=False, autocommit=False)
+    except Exception, e:
+        module.fail_json(msg="unable to connect to database: %s" % e)
+    
+    try:
+        changed = check_condition(db_connection, condition)
+    except ValueError as e:
+        module.fail_json(msg=e)
+    
+    if module.check_mode:
+        module.exit_json(changed=changed,db=db)
+    elif changed==False:
+        module.exit_json(name=db, changed=changed, msg="OK")
+    else:
+        # Excecute migration script.
+        with open(script, "r") as f:
+            script_content = f.read()
+            cursor = db_connection.cursor()
+            try:
+                cursor.execute(script_content)
+                db_connection.commit()
+                module.exit_json(name=db, changed=changed, msg="OK")
+            except Exception, e:
+                module.fail_json(msg="Script failed to exeute: %s" % e.message, detail=traceback.format_exc())
+            finally:
+                db_connection.rollback()
+                cursor.close()
+
+# import module snippets
+from ansible.module_utils.basic import *
+
+main()
